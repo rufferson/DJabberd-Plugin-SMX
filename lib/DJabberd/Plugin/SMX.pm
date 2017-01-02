@@ -294,4 +294,39 @@ sub process {
     }
 }
 
+=head1 FLOW CONTROL
+
+There's internal option called paranoid and context option called flowcontrol.
+
+It was added as experimental flow control option which dimed useless in current
+circumstances. Danga::Socket is not truly asynchronous event processing wrapper
+as python twisted - where event loop runs in own helper thread, separately from
+main loop thread.
+
+This, together with synchronous nature of TCP creates a mess when dealing with
+truly asynchronous clients. They are emitting stanzas in arbitrary order,
+while all of them are processed sequentually by Danga::Socket loop, picking
+data from tcp queue. SMX is then halting egress stream agressively requesting
+for acknowledgement of last emitted stanza, but client will see it only after
+Danga::Socket walked through entire TCP backlog, which would already contain
+all previously emitted request/answer stanzas.
+
+In short - don't use it. Unless you intend to experiment with UDP transport or
+perl threads (eg. non-sequentual transport or truly async events). TCP flow
+control is already good enough so SM is intended to detect tcp teardown
+(informative ack), not replace flow control (delivery ack).
+
+=cut
+=head1 AUTHOR
+
+Ruslan N. Marchenko, C<< <me at ruff.mobi> >>
+
+=head1 COPYRIGHT & LICENSE
+
+Copyright 2016 Ruslan N. Marchenko, all rights reserved.
+
+This program is free software; you can redistribute it and/or modify it
+under the same terms as Perl itself.
+
+=cut
 1;

@@ -155,8 +155,7 @@ sub add_conn {
 sub del_conn {
     my $self = shift;
     my $smid = shift;
-    delete $self->{cons}->{$smid};
-    delete $self->{ctxs}->{$smid};
+    return (delete $self->{cons}->{$smid},delete $self->{ctxs}->{$smid});
 }
 
 sub get_ctx {
@@ -175,7 +174,7 @@ use base 'DJabberd::Stanza';
 sub deliver {
     my $self = shift;
     my $conn = shift || $self->connection;
-    # We're sending response as scalar, not ref, hence it's not counted in tx
+    # We're sending response as scalar, not ref, hence it's not handled externally
     $logger->logconfess("No connection, cannot manage nothing") unless($conn);
     $logger->debug("Writing to wire ".$self->as_xml);
     unless($conn->write($self->as_xml)) {
@@ -204,9 +203,8 @@ sub process {
     my $ctx = { rx => 0, tx => 0, ack => 0, nack => 0, state => 'active', win => 1, last => 0, jid => $conn->bound_jid->as_string, queue => [], ns => $self->attr('{}xmlns') };
     $resp->set_attr('{}id',$conn_id);
     if($plug->{resume} && ($self->attr('{}resume')||'') eq 'true') {
-	$resp->set_attr('{}max',$plug->{max}) if($plug->{max});
+	$resp->set_attr('{}max',$ctx->{max} = $plug->{resume});
 	$resp->set_attr('{}location',$plug->location) if($plug->location);
-	$ctx->{resume} = $plug->{max};
     } else {
 	delete $resp->attrs->{'{}resume'};
     }
@@ -214,27 +212,26 @@ sub process {
     # Inject sm context id into Connection object
     $conn->{in_stream} = $conn_id;
     $plug->add_conn($conn_id, $conn, $ctx);
-    # Injecting a wire-wrapper to do flow control
+    # Injecting a wire-wrapper to intercept stanza writes
     $conn->add_write_handler(sub {
 	my ($conn, $ref, @stuff) = @_;
 	# first of all store the stanza and increase tx
-	$logger->debug("Incoming [".$ctx->{tx}."]: ".substr($$ref,0,10)."...");
 	push(@{$ctx->{queue}},$ref);
 	$ctx->{tx}++;
 	# if we're good - run flow control process
-	# window never closes by SM, only from outside (eg. CSI)
+	# window is never shut by SM, only from outside (eg. CSI)
 	if(!$conn->{closed} && $ctx->{win} > 0) {
 	    my $d = $ctx->{tx} - $ctx->{ack};
 	    # push data to the wire if window allows and we're enforcing flow control
 	    if(!$ctx->{flowctl} or $d <= $ctx->{win}) {
 		$conn->write($$ref);
-		$logger->debug("Delivering[".$ctx->{tx}."]: ".substr($$ref,0,10)."...");
+		$logger->debug("Delivering[".$ctx->{tx}."]: ".substr($$ref,0,33)."...");
 		$ctx->{last} = $ctx->{tx};
 	    }
 	    # if window is full - request ack (mimicking tcp sliding window)
 	    if($d >= $ctx->{win}) {
-		$logger->debug("Requesting ack for ".$ctx->{ack}." < ".$d." < ".$ctx->{tx}." @ ".$ctx->{win}." / ".$ctx->{nack});
-		$conn->write("<r xmlns='".$ctx->{ns}."'/>") or $conn->write(undef);
+		$logger->debug("Requesting ack for (ack<delta<last<=tx\@win/nack) ".$ctx->{ack}." < ".$d." < ".$ctx->{last}." <= ".$ctx->{tx}." @ ".$ctx->{win}." / ".$ctx->{nack});
+		$conn->write("<r xmlns='".$ctx->{ns}."'/>") or $conn->write(undef); # enforce if queued
 		# if it's more than full - try to narrow down the window
 		$ctx->{win}-- if($ctx->{win}>1 && $ctx->{nack}>0);
 		# and pump the nack pressure
@@ -242,7 +239,7 @@ sub process {
 	    }
 	}
     });
-    $logger->debug("Attempting to deliver SMX response: ".$resp->as_xml);
+    $logger->debug("Attempting to deliver SM response: ".$resp->as_xml);
     # now signal the other side we're ready
     $resp->deliver($conn);
 }
@@ -271,7 +268,7 @@ sub process {
     my $ctx = $plug->get_ctx($conn->{in_stream});
     return unless($ctx);
     my $h = $self->attr('{}h');
-    # we MAY error-close the stream, but let just ignore such things.
+    # we MAY error-close the stream, so let just do it as it may corrupt the queue and basically means we're not in sync with the other side anyway
     $logger->logcroak("Invalid SM ACK: $h </> for ".$ctx->{ack}." last ".$ctx->{last}) unless(defined $h && $ctx->{ack} <= $h && $h <= $ctx->{last});
     # ack stepped up, decrease nack pressure
     $ctx->{nack}-- if($ctx->{nack}>0 && $h > $ctx->{ack});

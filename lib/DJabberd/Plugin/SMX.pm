@@ -34,18 +34,32 @@ signaling (hence eXtended).
 
     <VHost mydomain.com>
 	<Plugin DJabberd::Plugin::SMX>
-	    resume = <timeout_secs>
-	    location = <reconnect_addr:port>
-	    csi = <bool>
+	    resume <timeout_secs>
+	    location <reconnect_addr:port>
+	    csi <soft|hard>
 	</Plugin>
     </VHost>
 
-C<resume> here enables connection resumption with specified dead timeout, which is 0 hence disabled by default;
+C<resume> here enables connection resumption with specified dead timeout, which
+is 0 hence disabled by default;
 
 C<location> sepcifies direct ip:port where session should be restored.
 Use to avoid DNS loadbalancing in clustered environment.
 
 C<csi> enables Client State Indication support which is also off by default.
+Soft param just enables filtering while hard option totally stops egress
+traffic, queueing it up in SM resumption buffer. Filtering and queuing is
+activated only on reception of the <inactve/> nonza. On <active/> or resumption
+the queue is flushed and filters are lifted.
+
+B<Important:> it is required that client supports SM to have CSI working. Mere CSI
+support won't work since context reference is stored as SM ID. CSI nonzas are
+ignored without SM context.
+
+For debugging purposes - for clients which support SM but not CSI (i.e. gajim)
+option C<smcsi> will enable counting CSI nonzas in SM C<h> counter. Otherwise
+after manually injecting CSI nonza following C<a> aborts the stream.
+
 =cut
 
 sub set_config_resume {
@@ -60,12 +74,17 @@ sub set_config_location {
     my $self = shift;
     $self->{location} = shift;
 }
+sub set_config_smcsi {
+    my $self = shift;
+    $self->{smcsi} = shift || 0;
+}
 
 sub finalize {
     my $self = shift;
     $self->{csi} ||= 0;
     $self->{resume} ||= 0;
     $self->{location} ||= '';
+    $self->{smcsi} ||= 0;
 }
 
 =head2 register($self, $vhost)
@@ -75,16 +94,22 @@ Register the vhost with the module.
 =cut
 
 my %cls = (
-    r => 'R',
-    a => 'A',
-    enable => 'Enable',
-    resume => 'Resume',
+    '{'.NSv2.'}r' => 'R',
+    '{'.NSv3.'}r' => 'R',
+    '{'.NSv2.'}a' => 'A',
+    '{'.NSv3.'}a' => 'A',
+    '{'.NSv2.'}enable' => 'Enable',
+    '{'.NSv3.'}enable' => 'Enable',
+    '{'.NSv2.'}resume' => 'Resume',
+    '{'.NSv3.'}resume' => 'Resume',
+    '{'.NSCS.'}active'   => 'CSA',
+    '{'.NSCS.'}inactive' => 'CSI',
 );
 sub register {
     my ($self,$vhost) = @_;
     my $stanza_cb = sub {
 	my ($vh, $cb, $xe, $c) = @_;
-	if(my $cl = $cls{$xe->element_name}) {
+	if(my $cl = $cls{$xe->element}) {
 	    my $class = 'DJabberd::Stanza::SMX::'.$cl;
 	    $logger->debug("Trying to handle with class $class");
 	    return $cb->handle($class);
@@ -103,6 +128,15 @@ sub register {
 	}
 	$cb->decline;
     };
+    my $filter_cb = sub {
+	my ($vh, $cb, $get) = @_;
+	my $stz = $get->();
+	my $ctx = $self->get_ctx($stz->connection->{in_stream});
+	return $cb->decline unless($ctx && ref($ctx));
+	return $cb->decline if($ctx->{state} eq 'active');
+	return $cb->decline unless($self->filter_stanza($stz,$ctx));
+	$cb->stop_chain;
+    };
     my $closure_cb = sub {
 	my ($vh, $cb, $c) = @_;
 	$logger->debug('Callback for stream '.$c->stream_id.' ['.$c->{id}.'] '.$c->{in_stream}.' for '.($c->bound_jid||'<null>'));
@@ -114,6 +148,7 @@ sub register {
     $self->{vhost} = $vhost;
     $vhost->register_hook("HandleStanza",$stanza_cb);
     $vhost->register_hook("filter_incoming_client",$handler_cb);
+    $vhost->register_hook("pre_stanza_write",$filter_cb);
     $vhost->register_hook("ConnectionClosing",$closure_cb);
     $vhost->register_hook('SendFeatures',sub {
         my ($vh, $cb, $conn) = @_;
@@ -136,8 +171,16 @@ sub stash_conn {
     return 0 unless($ctx && ref($ctx) eq 'HASH' && $ctx->{resume});
     # release resources and remove from event loop
     DJabberd::Connection::close($conn); # damn I hate these types of calls but there's no other way
-    # TODO: start timer for resume secs,
-    # TODO: unregister user (and discard/deliver queue) om timeout
+    # but now allow connection to be used for delivery
+    $conn->{closed} = -1;
+    # Setup resume timeout handler
+    $ctx->{timeout} = Danga::Socket::AddTimer($ctx->{resume},sub {
+	# Restore normal closed state
+	$conn->{closed} = 1;
+	$conn->{in_stream} = 0;
+	# This will trigger unregister and call cleanup to remove con/ctx
+	$conn->close;
+    });
     return 1;
 }
 
@@ -194,6 +237,28 @@ sub get_ctx {
     my $self = shift;
     my $smid = shift;
     return $self->{ctxs}->{$smid};
+}
+
+sub filter_stanza {
+    my $slef = shift;
+    my $stz = shift;
+    my $ctx = shift;
+    if($stz->element_name eq 'message') {
+	# pass the message with body on - if it's normal chat
+	my $type = $stz->attr('{}type') || 'normal';
+	if($type eq 'chat' or $type eq 'normal') {
+	    return 0 if(grep {$_->element_name eq 'body'} $stz->children_elements);
+	}
+    } elsif($stz->element_name eq 'iq') {
+	# we can hardly filter iq, it's interactive
+	return 0;
+    } else {
+	# well, presence, it can be chatty so we may need to track it [TODO]
+	# To keep it simple let just allow for now
+	return 0;
+    }
+    # drop this one
+    return 1;
 }
 
 sub flowctl {
@@ -358,14 +423,14 @@ sub process {
     }
     my $h = DJabberd::Stanza::SMX::A::validate($self,$ctx);
     if($h<0) {
-	$self->reply_error('unexpected-request',
+	$self->reply_error('item-not-found',
 	    "Cannot resume SM for this connection: handled seq.num is off the window ".$ctx->{last}." >>> ".$ctx->{tx});
 	return;
     }
     my $old = $plug->get_conn($smid);
     unless($old->{closed} && $old->bound_jid && $old->vhost == $conn->vhost) {
-	$self->reply_error('unexpected-request',
-	    "Cannot resume SM for this connection: orignal connection ".$old->{id}." is still alive or unbound");
+	$self->reply_error('item-not-found',
+	    "Cannot resume SM for this connection: orignal connection ".$old->{id}." is still alive or already unbound");
 	return;
     }
     # we're positive about resumption now, just do it
@@ -385,7 +450,7 @@ sub process {
     # Steal JID binding - This is your last chance.
     $conn->vhost->register_jid($jid,$jid->resource,$conn,$cb);
     unless($ctx) {
-	$self->reply_error('unexpected-request',
+	$self->reply_error('item-not-found',
 	    "Cannot resume SM for this connection: JID rebind failed for ".$jid->as_string);
 	return;
     }
@@ -405,6 +470,7 @@ sub process {
     $ctx->{win} = $ctx->{tx} - $h; # open wide to flush them all
     # and see how deep the rabbit hole goes.
     DJabberd::Stanza::SMX::A::process($self,$plug,$conn,$ctx,$h);
+    DJabberd::Stanza::SMX::CSA::process($self,$plug,$conn,$ctx,$smid) if($ctx->{state} ne 'active');
 }
 
 package DJabberd::Stanza::SMX::R;
@@ -483,6 +549,63 @@ sub process {
 	$logger->debug("Flushed $h items from the queue, waiting for ack...");
 	$ctx->{win} = 1 if($ctx->{win} > $plug->max_win); # reset window
     }
+}
+
+package DJabberd::Stanza::SMX::CSA;
+use base 'DJabberd::Stanza::SMX';
+
+sub process {
+    my $self = shift;
+    my $plug = shift;
+    my $conn = shift;
+    my $ctx = shift;
+    my $smid = shift || $conn->{in_stream};
+    unless($ctx && ref($ctx) eq 'HASH') {
+	$ctx = $plug->get_ctx($smid);
+	unless($ctx) {
+	    $logger->debug("Cannot handle Client State without Stream Management");
+	    return;
+	}
+	$ctx->{rx}++ if($plug->{smcsi});
+	return if($ctx->{state} eq 'active');
+    }
+    $logger->debug("User indicated active state, resuming normal flow from ".$ctx->{state});
+    if($ctx->{win} <= 0) {
+	# open the window and flush the queue
+	if($ctx->{tx}>$ctx->{last}) {
+	    $ctx->{win} = $ctx->{tx} - $ctx->{last};
+	    DJabberd::Stanza::SMX::A($self,$plug,$ctx,$ctx->{tx});
+	} else {
+	    $ctx->{win} = 1;
+	}
+    }
+    # now flush accumulated presence
+    # TODO
+    # and lift the filters
+    $ctx->{state} = 'active';
+}
+
+package DJabberd::Stanza::SMX::CSI;
+use base 'DJabberd::Stanza::SMX';
+
+sub process {
+    my $self = shift;
+    my $plug = shift;
+    my $conn = shift;
+    my $ctx = shift;
+    my $smid = shift || $conn->{in_stream};
+    unless($ctx && ref($ctx) eq 'HASH') {
+	$ctx = $plug->get_ctx($smid);
+	unless($ctx) {
+	    $logger->debug("Cannot handle Client State without Stream Management");
+	    return;
+	}
+    }
+    $ctx->{rx}++ if($plug->{smcsi});
+    return if($ctx->{state} ne 'active' or !$plug->{csi});
+    $ctx->{state} = 'inactive';
+    $ctx->{win} = 0 if($plug->{csi} eq 'hard');
+    $logger->debug("User indicated inactive state, making ".$plug->{csi}." suspension");
 }
 
 =head1 FLOW CONTROL

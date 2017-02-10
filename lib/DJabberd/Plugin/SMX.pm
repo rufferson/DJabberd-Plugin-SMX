@@ -5,10 +5,14 @@ use strict;
 use base 'DJabberd::Plugin';
 use MIME::Base64;
 
+# Deps
+use DJabberd::Delivery::OfflineStorage;
+
 use constant {
 	NSv2 => "urn:xmpp:sm:2",
 	NSv3 => "urn:xmpp:sm:3",
 	NSCS => "urn:xmpp:csi:0",
+	NSGQ => "google:queue",
 	MAX_WIN => 6,
 };
 
@@ -105,10 +109,15 @@ my %cls = (
     '{'.NSCS.'}active'   => 'CSA',
     '{'.NSCS.'}inactive' => 'CSI',
 );
+my %gq2cs = (
+    '{'.NSGQ.'}enable'  => 'DJabberd::Stanza::SMX::CSI',
+    '{'.NSGQ.'}disable' => 'DJabberd::Stanza::SMX::CSA',
+);
 sub register {
     my ($self,$vhost) = @_;
     my $stanza_cb = sub {
 	my ($vh, $cb, $xe, $c) = @_;
+	return $self unless($vh);
 	if(my $cl = $cls{$xe->element}) {
 	    my $class = 'DJabberd::Stanza::SMX::'.$cl;
 	    $logger->debug("Trying to handle with class $class");
@@ -131,11 +140,16 @@ sub register {
     my $filter_cb = sub {
 	my ($vh, $cb, $get) = @_;
 	my $stz = $get->();
-	my $ctx = $self->get_ctx($stz->connection->{in_stream});
+	return $cb->decline if($stz->connection->is_server);
+	my $ctx = $self->get_ctx($stz->connection->{in_stream}) || $self->get_ctx($stz->connection->bound_jid->as_string);
 	return $cb->decline unless($ctx && ref($ctx));
 	return $cb->decline if($ctx->{state} eq 'active');
-	return $cb->decline unless($self->filter_stanza($stz,$ctx));
-	$cb->stop_chain;
+	if($self->filter_stanza($stz,$ctx)) {
+	    $cb->stop_chain;
+	} else {
+	    $self->flush($stz->connection);
+	    $cb->decline;
+	}
     };
     my $closure_cb = sub {
 	my ($vh, $cb, $c) = @_;
@@ -145,7 +159,24 @@ sub register {
 	$self->gc_conn($c);
 	$cb->decline;
     };
+    my $c2s_iq_cb = sub {
+	my ($vh, $cb, $iq) = @_;
+	if($iq->signature eq 'set-{'.NSGQ.'}query') {
+	    # This is Google's CSI equivalent.
+	    $logger->debug("Queueing: ".$iq->as_xml);
+	    my $ctx = $self->get_ctx($iq->connection);
+	    foreach($iq->first_element->children_elements) {
+		$gq2cs{$_->element}->process($self,$iq->connection,$ctx)
+		    if(exists $gq2cs{$_->element});
+	    }
+	    $self->flush($iq->connection,$ctx);
+	    $iq->send_result;
+	    return $cb->stop_chain;
+	}
+	$cb->decline;
+    };
     $self->{vhost} = $vhost;
+    Scalar::Util::weaken($self->{vhost});
     $vhost->register_hook("HandleStanza",$stanza_cb);
     $vhost->register_hook("filter_incoming_client",$handler_cb);
     $vhost->register_hook("pre_stanza_write",$filter_cb);
@@ -156,6 +187,8 @@ sub register {
 	    if($conn->sasl && $conn->sasl->authenticated_jid);
 	$cb->decline;
     });
+    $vhost->register_hook("c2s-iq",$c2s_iq_cb);
+    $vhost->caps->add(DJabberd::Caps::Feature->new(NSGQ));
 }
 
 sub vh {
@@ -191,6 +224,7 @@ sub gc_conn {
     my $smid = $conn->{in_stream};
     $smid = $self->conn_id($conn) unless($smid && $self->{cons}->{$smid} && $self->{cons}->{$smid} == $conn);
     my ($con,$ctx) = $self->cleanup($smid);
+    $ctx = delete $self->{ctxs}->{$conn->bound_jid->as_string} unless($ctx && ref($ctx));
     $logger->error("Cannot cleanup resources for connection ".$conn->{id}." with smid $smid") unless($ctx && ref($ctx));
 }
 
@@ -236,7 +270,14 @@ sub cleanup {
 sub get_ctx {
     my $self = shift;
     my $smid = shift;
-    return $self->{ctxs}->{$smid};
+    return $self->{ctxs}->{$smid}
+	unless(ref($smid));
+    return $self->{ctxs}->{$smid->{in_stream}}
+	if($smid->{in_stream} && exists $self->{ctxs}->{$smid->{in_stream}});
+    return $self->{ctxs}->{$smid->bound_jid->as_string}
+	if(!$smid->is_server && exists $self->{ctxs}->{$smid->bound_jid->as_string});
+    return undef if($smid->is_server);
+    return $self->{ctxs}->{$smid->bound_jid->as_string} = { state => 'active', pq => {}};
 }
 
 sub filter_stanza {
@@ -253,12 +294,28 @@ sub filter_stanza {
 	# we can hardly filter iq, it's interactive
 	return 0;
     } else {
-	# well, presence, it can be chatty so we may need to track it [TODO]
-	# To keep it simple let just allow for now
+	# well, presence, it can be chatty so we may need to queue
+	if(!$stz->type || $stz->type eq 'unavailable') {
+	    DJabberd::Delivery::OfflineStorage::add_delay($stz);
+	    $ctx->{pq}->{$stz->from} = $stz;
+	    return 1;
+	}
 	return 0;
     }
     # drop this one
     return 1;
+}
+
+sub flush {
+    my $self = shift;
+    my $conn = shift;
+    my $ctx = shift || $self->get_ctx($conn);
+    foreach(keys(%{$ctx->{pq}})) {
+	my $stz = delete $ctx->{pq}->{$_};
+	if($stz && ref($stz)) {
+	    $conn->write_stanza($stz);
+	}
+    }
 }
 
 sub flowctl {
@@ -339,7 +396,7 @@ sub process {
     unless($ctx && ref($ctx) eq 'HASH') {
 	return unless($self->validate($plug,$conn,$conn_id));
 	# Initialize brand new one unless it was passed to us
-	$ctx = { rx => 0, tx => 0, ack => 0, nack => 0, win => 1, last => 0, state => 'active', jid => $conn->bound_jid->as_string, queue => [], ns => $self->attr('{}xmlns') };
+	$ctx = { rx => 0, tx => 0, ack => 0, nack => 0, win => 1, last => 0, state => 'active', queue => [], ns => $self->attr('{}xmlns') };
 	$ctx->{flowctl} = $plug->flowctl;
 	# Inject sm context id into Connection object
 	$plug->add_conn($conn_id, $conn, $ctx);
@@ -365,7 +422,8 @@ sub process {
 	    }
 	    # if window is full - request ack (mimicking tcp sliding window)
 	    if($d >= $ctx->{win}) {
-		$logger->debug("Requesting ack for (ack<delta<last<=tx\@win/nack) ".$ctx->{ack}." < ".$d." < ".$ctx->{last}." <= ".$ctx->{tx}." @ ".$ctx->{win}." / ".$ctx->{nack});
+		$logger->debug("Requesting ack for (ack<delta<last<=tx\@win/nack) ".
+			$ctx->{ack}." < ".$d." < ".$ctx->{last}." <= ".$ctx->{tx}." @ ".$ctx->{win}." / ".$ctx->{nack});
 		my $xml = "<r xmlns='".$ctx->{ns}."'/>";
 		$conn->log_outgoing_data($xml);
 		$conn->write($xml) or $conn->write(undef); # enforce if queued
@@ -470,7 +528,7 @@ sub process {
     $ctx->{win} = $ctx->{tx} - $h; # open wide to flush them all
     # and see how deep the rabbit hole goes.
     DJabberd::Stanza::SMX::A::process($self,$plug,$conn,$ctx,$h);
-    DJabberd::Stanza::SMX::CSA::process($self,$plug,$conn,$ctx,$smid) if($ctx->{state} ne 'active');
+    DJabberd::Stanza::SMX::CSA::process($self,$plug,$conn,$ctx) if($ctx->{state} ne 'active');
 }
 
 package DJabberd::Stanza::SMX::R;
@@ -489,7 +547,6 @@ sub process {
     my $self = shift;
     my $plug = shift;
     my $conn = shift;
-    my $smid = shift;
     my $ctx = $plug->get_ctx($conn->{in_stream});
     return unless($ctx);
     my $resp = $self->make_response($plug,$conn,$ctx);
@@ -559,11 +616,10 @@ sub process {
     my $plug = shift;
     my $conn = shift;
     my $ctx = shift;
-    my $smid = shift || $conn->{in_stream};
     unless($ctx && ref($ctx) eq 'HASH') {
-	$ctx = $plug->get_ctx($smid);
+	$ctx = $plug->get_ctx($conn);
 	unless($ctx) {
-	    $logger->debug("Cannot handle Client State without Stream Management");
+	    $logger->debug("Cannot obtain connection context ".$conn->{stream_id}." ".$conn->{in_stream}." ".$conn->bound_jid);
 	    return;
 	}
 	$ctx->{rx}++ if($plug->{smcsi});
@@ -593,15 +649,14 @@ sub process {
     my $plug = shift;
     my $conn = shift;
     my $ctx = shift;
-    my $smid = shift || $conn->{in_stream};
     unless($ctx && ref($ctx) eq 'HASH') {
-	$ctx = $plug->get_ctx($smid);
+	$ctx = $plug->get_ctx($conn);
 	unless($ctx) {
-	    $logger->debug("Cannot handle Client State without Stream Management");
+	    $logger->debug("Cannot obtain connection context ".$conn->{stream_id}." ".$conn->{in_stream}." ".$conn->bound_jid);
 	    return;
 	}
+	$ctx->{rx}++ if($plug->{smcsi});
     }
-    $ctx->{rx}++ if($plug->{smcsi});
     return if($ctx->{state} ne 'active' or !$plug->{csi});
     $ctx->{state} = 'inactive';
     $ctx->{win} = 0 if($plug->{csi} eq 'hard');

@@ -133,7 +133,7 @@ sub register {
 	    return $cb->stop_chain;
 	} else {
 	    my $ctx = $self->get_ctx($c->{in_stream});
-	    $ctx->{rx}++ if($ctx && ref($ctx) eq 'HASH');
+	    $ctx->{rx}++ if($ctx && ref($ctx));
 	}
 	$cb->decline;
     };
@@ -201,13 +201,13 @@ sub stash_conn {
     my $conn = shift;
     my $ctx = $self->get_ctx($conn->{in_stream});
     $logger->debug("Attempting to stash the conn ".$conn->{id}." with ".$conn->{in_stream}." and ".($ctx || '<null_ctx>'));
-    return 0 unless($ctx && ref($ctx) eq 'HASH' && $ctx->{resume});
+    return 0 unless($ctx && ref($ctx) && $ctx->{resume});
     # release resources and remove from event loop
     DJabberd::Connection::close($conn); # damn I hate these types of calls but there's no other way
     # but now allow connection to be used for delivery
     $conn->{closed} = -1;
     # Setup resume timeout handler
-    $ctx->{timeout} = Danga::Socket::AddTimer($ctx->{resume},sub {
+    $ctx->{timeout} = Danga::Socket->AddTimer($ctx->{resume},sub {
 	# Restore normal closed state
 	$conn->{closed} = 1;
 	$conn->{in_stream} = 0;
@@ -225,7 +225,11 @@ sub gc_conn {
     $smid = $self->conn_id($conn) unless($smid && $self->{cons}->{$smid} && $self->{cons}->{$smid} == $conn);
     my ($con,$ctx) = $self->cleanup($smid);
     $ctx = delete $self->{ctxs}->{$conn->bound_jid->as_string} unless($ctx && ref($ctx));
-    $logger->error("Cannot cleanup resources for connection ".$conn->{id}." with smid $smid") unless($ctx && ref($ctx));
+    if($ctx && ref($ctx)) {
+	$ctx->stop_hb;
+    } else {
+	$logger->error("Cannot cleanup resources for connection ".$conn->{id}." with smid $smid/".$conn->bound_jid->as_string);
+    }
 }
 
 sub conn_id {
@@ -263,7 +267,6 @@ sub cleanup {
     my @ret = (delete $self->{cons}->{$smid},delete $self->{ctxs}->{$smid});
     # Get rid of closures
     $ret[0]->{write_handlers} = [];
-    #$ret[1]->{next}->cancel if($ret[1]->{next});
     return @ret;
 }
 
@@ -277,7 +280,7 @@ sub get_ctx {
     return $self->{ctxs}->{$smid->bound_jid->as_string}
 	if(!$smid->is_server && exists $self->{ctxs}->{$smid->bound_jid->as_string});
     return undef if($smid->is_server);
-    return $self->{ctxs}->{$smid->bound_jid->as_string} = { state => 'active', pq => {}};
+    return $self->{ctxs}->{$smid->bound_jid->as_string} = DJabberd::Plugin::SMX::Ctx->new;
 }
 
 sub filter_stanza {
@@ -323,6 +326,97 @@ sub flowctl {
     return $self->{paranoid} || 0;
 }
 
+package DJabberd::Plugin::SMX::Ctx;
+
+sub new {
+    my $class = shift;
+    my $self = bless {
+	state => 'active',
+	next => undef,
+	pq => {},
+	@_
+    }, $class;
+    return $self;
+}
+
+sub start_hb {
+    my $self = shift;
+    my $conn = shift;
+    my $time = shift || 300;
+    $self->stop_hb;
+    $self->{next} = Danga::Socket->AddTimer($time,$self->do_hb($conn,$time));
+    Scalar::Util::weaken($self->{next});
+}
+
+sub stop_hb {
+    my $self = shift;
+    if(exists $self->{next} && ref($self->{next})) {
+	#$self->{next}->cancel;
+	(delete $self->{next})->cancel;
+    }
+}
+
+sub do_hb {
+    my $self = shift;
+    my $conn = shift;
+    my $time = shift;
+    return sub {
+        $conn->write(' ') or $conn->write(undef); # enforce if queued
+	$logger->debug("Whitespace ping! at connection ".$conn->{id});
+	$self->start_hb($conn,$time);
+    };
+}
+
+package DJabberd::Plugin::SMX::Ctx::SM;
+use base 'DJabberd::Plugin::SMX::Ctx';
+
+sub new {
+    my $class = shift;
+    my $self = $class->SUPER::new(
+	rx => 0, tx => 0,
+	ack => 0, nack => 0,
+	last => 0,
+	win => 1,
+	queue => [],
+	@_
+    );
+    return $self;
+}
+
+sub r {
+    my $self = shift;
+    my $conn = shift;
+    my $delta = shift || $self->{tx}-$self->{ack};
+    $logger->debug("Requesting ack for (ack<delta<last<=tx\@win/nack) "
+	    .$self->{ack}." < ".$delta." < ".$self->{last}." <= ".$self->{tx}
+	    ." @ ".$self->{win}." / ".$self->{nack});
+    my $xml = "<r xmlns='".$self->{ns}."'/>";
+    $conn->log_outgoing_data($xml);
+    $conn->write($xml) or $conn->write(undef); # enforce if queued
+}
+
+sub do_hb {
+    my $self = shift;
+    my $conn = shift;
+    return sub {
+	$logger->debug("SM ping! at connection ".$conn->{id});
+	$self->r($conn);
+    };
+}
+
+sub ack {
+    my ($self,$ack) = @_;
+    # ack stepped up, decrease nack pressure
+    $self->{nack}-- if($self->{nack}>0 && $ack > $self->{ack});
+    # discard acked events from the queue
+    while($self->{ack} < $ack) {
+	$self->{ack}++;
+	shift(@{$self->{queue}});
+    }
+    $logger->debug("Advancing queue to $ack, ".scalar(@{$self->{queue}})
+	    ." items remain[".$self->{ack}.':'.$self->{last}.':'.$self->{tx}.']');
+}
+
 package DJabberd::Stanza::SMX;
 use base 'DJabberd::Stanza';
 sub deliver {
@@ -364,7 +458,8 @@ sub validate {
     my $conn_id = shift;
     unless($conn->{in_stream} && !$conn->{closed} && $conn->stream_id && $conn->bound_jid && !$plug->get_ctx($conn_id) && !$plug->get_ctx($conn->{in_stream})) {
 	$self->reply_error("unexpected-request",
-	    "Cannot enable SM for this connection: streamOpen:".$conn->{in_stream}."; ID:".$conn->stream_id."; bound:".$conn->bound_jid->as_string."; closed:".$conn->closed);
+	    "Cannot enable SM for this connection: streamOpen:".$conn->{in_stream}
+	    ."; ID:".$conn->stream_id."; bound:".$conn->bound_jid->as_string."; closed:".$conn->closed);
 	return 0;
     }
     return 1;
@@ -393,10 +488,10 @@ sub process {
     # these params are passed only from super calls when context is already set and validated
     my $ctx = shift;
     my $conn_id = shift || $plug->conn_id($self->connection);
-    unless($ctx && ref($ctx) eq 'HASH') {
+    unless($ctx && ref($ctx)) {
 	return unless($self->validate($plug,$conn,$conn_id));
 	# Initialize brand new one unless it was passed to us
-	$ctx = { rx => 0, tx => 0, ack => 0, nack => 0, win => 1, last => 0, state => 'active', queue => [], ns => $self->attr('{}xmlns') };
+	$ctx = DJabberd::Plugin::SMX::Ctx::SM->new(ns => $self->attr('{}xmlns'));
 	$ctx->{flowctl} = $plug->flowctl;
 	# Inject sm context id into Connection object
 	$plug->add_conn($conn_id, $conn, $ctx);
@@ -412,7 +507,7 @@ sub process {
 	# window is never shut by SM, only from outside (eg. CSI)
 	if(!$conn->{closed} && $ctx->{win} > 0) {
 	    # discard next ack timer if it hasn't fired
-	    #$ctx->{next}->cancel if($ctx->{next});
+	    $ctx->stop_hb;
 	    my $d = $ctx->{tx} - $ctx->{ack};
 	    # push data to the wire if window allows and we're enforcing flow control
 	    if(!$ctx->{flowctl} or $d <= $ctx->{win}) {
@@ -422,22 +517,14 @@ sub process {
 	    }
 	    # if window is full - request ack (mimicking tcp sliding window)
 	    if($d >= $ctx->{win}) {
-		$logger->debug("Requesting ack for (ack<delta<last<=tx\@win/nack) ".
-			$ctx->{ack}." < ".$d." < ".$ctx->{last}." <= ".$ctx->{tx}." @ ".$ctx->{win}." / ".$ctx->{nack});
-		my $xml = "<r xmlns='".$ctx->{ns}."'/>";
-		$conn->log_outgoing_data($xml);
-		$conn->write($xml) or $conn->write(undef); # enforce if queued
+		$ctx->r($conn,$d);
 		# if it's more than full - try to narrow down the window
 		$ctx->{win}-- if($ctx->{win}>1 && $ctx->{nack}>0);
 		# and pump the nack pressure
 		$ctx->{nack}++ if($d > $ctx->{win});
-	    #} else {
-	    #	# not sure we need it, resumption will provide latest ack anyway
-	    #	$ctx->{next} = Danga::Socket::AddTimer(3,sub {
-	    #	    delete $ctx->{next};
-	    #	    $logger->debug("Requesting ack for (ack<delta<last<=tx\@win/nack) ".$ctx->{ack}." < ".$d." < ".$ctx->{last}." <= ".$ctx->{tx}." @ ".$ctx->{win}." / ".$ctx->{nack});
-	    #	    $conn->write("<r xmlns='".$ctx->{ns}."'/>") or $conn->write(undef); # enforce if queued
-	    #	});
+	    } elsif($ctx->{state} ne 'active') {
+	    	# resumption will provide latest ack, but we may never mark conn as down while inactive
+		$ctx->start_hb($conn);
 	    }
 	}
     });
@@ -527,8 +614,11 @@ sub process {
     $ctx->{last} = $h;
     $ctx->{win} = $ctx->{tx} - $h; # open wide to flush them all
     # and see how deep the rabbit hole goes.
+    my $old_win = $ctx->{win};
+    $ctx->{win} = $ctx->{tx} - $ctx->{last};
     DJabberd::Stanza::SMX::A::process($self,$plug,$conn,$ctx,$h);
-    DJabberd::Stanza::SMX::CSA::process($self,$plug,$conn,$ctx) if($ctx->{state} ne 'active');
+    $plug->flush($conn,$ctx) if($ctx->{state} ne 'active');
+    $ctx->{win} = $old_win;
 }
 
 package DJabberd::Stanza::SMX::R;
@@ -570,9 +660,9 @@ sub process {
     my $conn = shift;
     my $ctx = shift;
     my $h = shift;
-    unless($ctx && ref($ctx) eq 'HASH') {
+    unless($ctx && ref($ctx)) {
 	$ctx = $plug->get_ctx($conn->{in_stream});
-	unless($ctx && ref($ctx) eq 'HASH') {
+	unless($ctx && ref($ctx)) {
 	    $logger->error('Got ack with no context: '.$conn->{in_stream});
 	    return;
 	}
@@ -581,14 +671,7 @@ sub process {
 	# basically means we're not in sync with the other side anyway
 	$logger->logcroak("Invalid SM ACK: $h </> for ".$ctx->{ack}." last ".$ctx->{last}) if($h<0);
     }
-    # ack stepped up, decrease nack pressure
-    $ctx->{nack}-- if($ctx->{nack}>0 && $h > $ctx->{ack});
-    # discard acked events from the queue
-    while($ctx->{ack} < $h) {
-	$ctx->{ack}++;
-	shift(@{$ctx->{queue}});
-    }
-    $logger->debug("Advancing queue to $h, ".scalar(@{$ctx->{queue}})." items remain[".$ctx->{ack}.':'.$ctx->{last}.':'.$ctx->{tx}.']');
+    $ctx->ack($h);
     # increase the window if we're not under pressure and no backlog
     if($ctx->{nack} == 0 && $ctx->{ack} == $ctx->{tx} && $ctx->{win} < $plug->max_win) {
 	$ctx->{win}++;
@@ -600,11 +683,13 @@ sub process {
 	    $conn->write(${$ctx->{queue}->[$h]});
 	    $ctx->{last}++;
 	}
-	my $xml = "<r xmlns='".$ctx->{ns}."'/>";
-	$conn->log_outgoing_data($xml);
-	$conn->write($xml) or $conn->write(undef);
+	$ctx->r($conn,$ceil);
 	$logger->debug("Flushed $h items from the queue, waiting for ack...");
 	$ctx->{win} = 1 if($ctx->{win} > $plug->max_win); # reset window
+    }
+    if($ctx->{nack} == 0 && $ctx->{state} ne 'active') {
+	# no ack pressure, silenced connection - schedule heartbeat
+	$ctx->start_hb($conn);
     }
 }
 
@@ -616,7 +701,7 @@ sub process {
     my $plug = shift;
     my $conn = shift;
     my $ctx = shift;
-    unless($ctx && ref($ctx) eq 'HASH') {
+    unless($ctx && ref($ctx)) {
 	$ctx = $plug->get_ctx($conn);
 	unless($ctx) {
 	    $logger->debug("Cannot obtain connection context ".$conn->{stream_id}." ".$conn->{in_stream}." ".$conn->bound_jid);
@@ -626,7 +711,7 @@ sub process {
 	return if($ctx->{state} eq 'active');
     }
     $logger->debug("User indicated active state, resuming normal flow from ".$ctx->{state});
-    if($ctx->{win} <= 0) {
+    if(exists $ctx->{win} && $ctx->{win} <= 0) {
 	# open the window and flush the queue
 	if($ctx->{tx}>$ctx->{last}) {
 	    $ctx->{win} = $ctx->{tx} - $ctx->{last};
@@ -636,7 +721,8 @@ sub process {
 	}
     }
     # now flush accumulated presence
-    # TODO
+    $plug->flush($conn,$ctx);
+    $ctx->stop_hb;
     # and lift the filters
     $ctx->{state} = 'active';
 }
@@ -649,7 +735,7 @@ sub process {
     my $plug = shift;
     my $conn = shift;
     my $ctx = shift;
-    unless($ctx && ref($ctx) eq 'HASH') {
+    unless($ctx && ref($ctx)) {
 	$ctx = $plug->get_ctx($conn);
 	unless($ctx) {
 	    $logger->debug("Cannot obtain connection context ".$conn->{stream_id}." ".$conn->{in_stream}." ".$conn->bound_jid);
@@ -659,8 +745,9 @@ sub process {
     }
     return if($ctx->{state} ne 'active' or !$plug->{csi});
     $ctx->{state} = 'inactive';
-    $ctx->{win} = 0 if($plug->{csi} eq 'hard');
+    $ctx->{win} = 0 if(exists $ctx->{win} && $ctx->{win} && $plug->{csi} eq 'hard' && ref($self));
     $logger->debug("User indicated inactive state, making ".$plug->{csi}." suspension");
+    $ctx->start_hb($conn);
 }
 
 =head1 FLOW CONTROL

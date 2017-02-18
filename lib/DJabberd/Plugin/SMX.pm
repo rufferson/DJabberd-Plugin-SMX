@@ -134,6 +134,7 @@ sub register {
 	} else {
 	    my $ctx = $self->get_ctx($c->{in_stream});
 	    $ctx->{rx}++ if($ctx && ref($ctx));
+	    $ctx->{ts} = time;
 	}
 	$cb->decline;
     };
@@ -204,16 +205,23 @@ sub stash_conn {
     return 0 unless($ctx && ref($ctx) && $ctx->{resume});
     # release resources and remove from event loop
     DJabberd::Connection::close($conn); # damn I hate these types of calls but there's no other way
+    $ctx->stop_hb;
     # but now allow connection to be used for delivery
     $conn->{closed} = -1;
     # Setup resume timeout handler
+    $logger->debug("Will expire connection ".$conn->{id}." in ".$ctx->{resume}." seconds");
     $ctx->{timeout} = Danga::Socket->AddTimer($ctx->{resume},sub {
-	# Restore normal closed state
+	$conn->log->info("Delayed session timed out unresumed: ".$conn->bound_jid->as_string."/".$conn->{in_stream});
+	# Unregister and call cleanup to remove con/ctx
+	$conn->{closed} = 0;
+	$conn->unbind;
+	$self->cleanup($conn->{in_stream});
 	$conn->{closed} = 1;
-	$conn->{in_stream} = 0;
-	# This will trigger unregister and call cleanup to remove con/ctx
+	$conn->{in_stream} = 1;
+	# run hook_chain which we've intercepted again
 	$conn->close;
     });
+    Scalar::Util::weaken($ctx->{timeout});
     return 1;
 }
 
@@ -321,11 +329,6 @@ sub flush {
     }
 }
 
-sub flowctl {
-    my $self = shift;
-    return $self->{paranoid} || 0;
-}
-
 package DJabberd::Plugin::SMX::Ctx;
 
 sub new {
@@ -346,13 +349,15 @@ sub start_hb {
     $self->stop_hb;
     $self->{next} = Danga::Socket->AddTimer($time,$self->do_hb($conn,$time));
     Scalar::Util::weaken($self->{next});
+    $logger->debug("Started timer ".$self->{next}."[".$self->{next}->[0]."]");
 }
 
 sub stop_hb {
     my $self = shift;
     if(exists $self->{next} && ref($self->{next})) {
-	#$self->{next}->cancel;
-	(delete $self->{next})->cancel;
+	my $tmr = delete $self->{next};
+	$tmr->cancel;
+	$logger->debug("Stopped timer $tmr\[".$tmr->[0]."]");
     }
 }
 
@@ -361,7 +366,8 @@ sub do_hb {
     my $conn = shift;
     my $time = shift;
     return sub {
-        $conn->write(' ') or $conn->write(undef); # enforce if queued
+        $conn->write(' ');
+	#$conn->write(' ') or $conn->write(undef); # enforce if queued
 	$logger->debug("Whitespace ping! at connection ".$conn->{id});
 	$self->start_hb($conn,$time);
     };
@@ -392,7 +398,8 @@ sub r {
 	    ." @ ".$self->{win}." / ".$self->{nack});
     my $xml = "<r xmlns='".$self->{ns}."'/>";
     $conn->log_outgoing_data($xml);
-    $conn->write($xml) or $conn->write(undef); # enforce if queued
+    #$conn->write($xml) or $conn->write(undef); # enforce if queued
+    $conn->write($xml);
 }
 
 sub do_hb {
@@ -427,7 +434,7 @@ sub deliver {
     $conn->log_outgoing_data($self->as_xml);
     unless($conn->write($self->as_xml)) {
 	$conn->log_outgoing_data("<~NUDGE~>");
-	$conn->write(undef);
+	#$conn->write(undef);
     }
 }
 sub make_response {
@@ -492,7 +499,6 @@ sub process {
 	return unless($self->validate($plug,$conn,$conn_id));
 	# Initialize brand new one unless it was passed to us
 	$ctx = DJabberd::Plugin::SMX::Ctx::SM->new(ns => $self->attr('{}xmlns'));
-	$ctx->{flowctl} = $plug->flowctl;
 	# Inject sm context id into Connection object
 	$plug->add_conn($conn_id, $conn, $ctx);
     }
@@ -503,19 +509,15 @@ sub process {
 	# first of all store the stanza and increase tx
 	push(@{$ctx->{queue}},$ref);
 	$ctx->{tx}++;
-	# if we're good - run flow control process
 	# window is never shut by SM, only from outside (eg. CSI)
 	if(!$conn->{closed} && $ctx->{win} > 0) {
 	    # discard next ack timer if it hasn't fired
 	    $ctx->stop_hb;
 	    my $d = $ctx->{tx} - $ctx->{ack};
-	    # push data to the wire if window allows and we're enforcing flow control
-	    if(!$ctx->{flowctl} or $d <= $ctx->{win}) {
-		$conn->write($$ref);
-		$logger->debug("Delivering[".$ctx->{tx}."]: ".substr($$ref,0,33)."...");
-		$ctx->{last} = $ctx->{tx};
-	    }
-	    # if window is full - request ack (mimicking tcp sliding window)
+	    # push data to the wire
+	    $conn->write($$ref);
+	    $ctx->{last} = $ctx->{tx};
+	    # if window is full - request ack
 	    if($d >= $ctx->{win}) {
 		$ctx->r($conn,$d);
 		# if it's more than full - try to narrow down the window
@@ -573,12 +575,32 @@ sub process {
 	return;
     }
     my $old = $plug->get_conn($smid);
-    unless($old->{closed} && $old->bound_jid && $old->vhost == $conn->vhost) {
+    unless($old->bound_jid && $old->vhost == $conn->vhost) {
 	$self->reply_error('item-not-found',
-	    "Cannot resume SM for this connection: orignal connection ".$old->{id}." is still alive or already unbound");
+	    "Cannot resume SM for this connection: orignal connection ".$old->{id}." is already unbound");
 	return;
     }
+    unless($old->{closed}) {
+	if((time - $ctx->{ts}) < $ctx->{resume}/2) {
+	    $self->reply_error('item-not-found',
+		"Cannot resume SM for this connection: orignal connection ".$old->{id}." is still active");
+	    return;
+	} else {
+	    # Terminate stream and close socket, straight and simple
+	    my $txt="Request to resume session $smid, current connection is stale";
+	    $old->write("
+		<stream:error><conflict xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>
+		    <text xmlns='urn:ietf:params:xml:ns:xmpp-streams'>
+			$txt
+		    </text>
+		</stream:error>
+	    </stream:stream>");
+	    $old->log->warn($old->{id}." conflict: $txt");
+	    DJabberd::Connection::close($old);
+	}
+    }
     # we're positive about resumption now, just do it
+    $ctx->{timeout}->cancel if(exists $ctx->{timeout} && ref($ctx->{timeout}));
     $plug->del_conn($smid);
     my $jid = $old->bound_jid;
     my $cb = DJabberd::Callback->new({
@@ -670,6 +692,7 @@ sub process {
 	# we MAY error-close the stream, so let just do it as it may corrupt the queue and
 	# basically means we're not in sync with the other side anyway
 	$logger->logcroak("Invalid SM ACK: $h </> for ".$ctx->{ack}." last ".$ctx->{last}) if($h<0);
+	$ctx->{ts} = time;
     }
     $ctx->ack($h);
     # increase the window if we're not under pressure and no backlog
@@ -707,6 +730,7 @@ sub process {
 	    $logger->debug("Cannot obtain connection context ".$conn->{stream_id}." ".$conn->{in_stream}." ".$conn->bound_jid);
 	    return;
 	}
+	$ctx->{ts} = time;
 	$ctx->{rx}++ if($plug->{smcsi});
 	return if($ctx->{state} eq 'active');
     }
@@ -750,30 +774,6 @@ sub process {
     $ctx->start_hb($conn);
 }
 
-=head1 FLOW CONTROL
-
-There's internal option called paranoid and context option called flowcontrol
-intended to complement [XEP-0198 v1.1 6] (sm:2) throttling requirements.
-
-It was added as experimental flow control option which dimed useless in current
-circumstances. Danga::Socket is not truly asynchronous event processing wrapper
-as python twisted - where event loop runs in own helper thread, separately from
-main loop thread.
-
-This, together with synchronous nature of TCP creates a mess when dealing with
-truly asynchronous clients. They are emitting stanzas in arbitrary order,
-while all of them are processed sequentually by Danga::Socket loop, picking
-data from tcp queue. SMX is then halting egress stream agressively requesting
-for acknowledgement of last emitted stanza, but client will see it only after
-Danga::Socket walked through entire TCP backlog, which would already contain
-all previously emitted request/answer stanzas.
-
-In short - don't use it. Unless you intend to experiment with UDP transport or
-perl threads (eg. non-sequentual transport or truly async events). TCP flow
-control is already good enough so SM is intended to detect tcp teardown
-(informative ack), not replace flow control (delivery ack).
-
-=cut
 =head1 AUTHOR
 
 Ruslan N. Marchenko, C<< <me at ruff.mobi> >>

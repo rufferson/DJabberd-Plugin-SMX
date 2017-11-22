@@ -739,7 +739,7 @@ sub process {
 	# open the window and flush the queue
 	if($ctx->{tx}>$ctx->{last}) {
 	    $ctx->{win} = $ctx->{tx} - $ctx->{last};
-	    DJabberd::Stanza::SMX::A($self,$plug,$ctx,$ctx->{tx});
+	    DJabberd::Stanza::SMX::A::process($self,$plug,$conn,$ctx,$ctx->{tx});
 	} else {
 	    $ctx->{win} = 1;
 	}

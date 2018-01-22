@@ -346,6 +346,7 @@ sub start_hb {
     my $self = shift;
     my $conn = shift;
     my $time = shift || 300;
+    $time = 30 unless($conn->is_available);
     $self->stop_hb;
     $self->{next} = Danga::Socket->AddTimer($time,$self->do_hb($conn,$time));
     Scalar::Util::weaken($self->{next});
@@ -581,7 +582,8 @@ sub process {
 	return;
     }
     unless($old->{closed}) {
-	if((time - $ctx->{ts}) < $ctx->{resume}/2) {
+	# inactive connection never receives external stanzas so needs to be really fresh
+	if((time - $ctx->{ts}) < ($old->is_available ? $ctx->{resume}/2 : 30)) {
 	    $self->reply_error('item-not-found',
 		"Cannot resume SM for this connection: orignal connection ".$old->{id}." is still active");
 	    return;
@@ -710,8 +712,8 @@ sub process {
 	$logger->debug("Flushed $h items from the queue, waiting for ack...");
 	$ctx->{win} = 1 if($ctx->{win} > $plug->max_win); # reset window
     }
-    if($ctx->{nack} == 0 && $ctx->{state} ne 'active') {
-	# no ack pressure, silenced connection - schedule heartbeat
+    if($ctx->{nack} == 0 && ($ctx->{state} ne 'active' || !$conn->is_available)) {
+	# no ack pressure, silenced or incomplete connection - schedule heartbeat
 	$ctx->start_hb($conn);
     }
 }

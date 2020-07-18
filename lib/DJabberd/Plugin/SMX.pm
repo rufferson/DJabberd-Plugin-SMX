@@ -207,7 +207,7 @@ sub stash_conn {
     DJabberd::Connection::close($conn); # damn I hate these types of calls but there's no other way
     $ctx->stop_hb;
     # but now allow connection to be used for delivery
-    $conn->{closed} = -1;
+    $conn->{closed} = DJabberd::Connection::CLOSED_TENTATIVELY;
     # Setup resume timeout handler
     $logger->debug("Will expire connection ".$conn->{id}." in ".$ctx->{resume}." seconds");
     $ctx->{timeout} = Danga::Socket->AddTimer($ctx->{resume},sub {
@@ -216,7 +216,7 @@ sub stash_conn {
 	$conn->{closed} = 0;
 	$conn->unbind;
 	$self->cleanup($conn->{in_stream});
-	$conn->{closed} = 1;
+	$conn->{closed} = DJabberd::Connection::CLOSED_PERMANENTLY;
 	$conn->{in_stream} = 1;
 	# run hook_chain which we've intercepted again
 	$conn->close;
@@ -285,10 +285,12 @@ sub get_ctx {
 	unless(ref($smid));
     return $self->{ctxs}->{$smid->{in_stream}}
 	if($smid->{in_stream} && exists $self->{ctxs}->{$smid->{in_stream}});
-    return $self->{ctxs}->{$smid->bound_jid->as_string}
-	if(!$smid->is_server && exists $self->{ctxs}->{$smid->bound_jid->as_string});
+    return undef unless(ref($smid->bound_jid));
+    my $full = $smid->bound_jid->as_string;
+    return $self->{ctxs}->{$full}
+	if(!$smid->is_server && exists $self->{ctxs}->{$full});
     return undef if($smid->is_server);
-    return $self->{ctxs}->{$smid->bound_jid->as_string} = DJabberd::Plugin::SMX::Ctx->new;
+    return $self->{ctxs}->{$full} = DJabberd::Plugin::SMX::Ctx->new;
 }
 
 sub filter_stanza {

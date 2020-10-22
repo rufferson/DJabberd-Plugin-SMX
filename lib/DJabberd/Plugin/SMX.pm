@@ -698,7 +698,7 @@ sub process {
 	$logger->logcroak("Invalid SM ACK: $h </> for ".$ctx->{ack}." last ".$ctx->{last}) if($h<0);
 	$ctx->{ts} = time;
     }
-    $ctx->ack($h);
+    $ctx->ack($h) unless($ctx->{state} eq 'activating');
     # increase the window if we're not under pressure and no backlog
     if($ctx->{nack} == 0 && $ctx->{ack} == $ctx->{tx} && $ctx->{win} < $plug->max_win) {
 	$ctx->{win}++;
@@ -739,6 +739,7 @@ sub process {
 	return if($ctx->{state} eq 'active');
     }
     $logger->debug("User indicated active state, resuming normal flow from ".$ctx->{state});
+    $ctx->{state} = 'activating';
     if(exists $ctx->{win} && $ctx->{win} <= 0) {
 	# open the window and flush the queue
 	if($ctx->{tx}>$ctx->{last}) {
